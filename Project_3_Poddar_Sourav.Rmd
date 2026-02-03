@@ -1,0 +1,652 @@
+---
+title: "Aspirin, the miracle drug"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+
+# Introduction
+
+We study whether **aspirin** helps prevent **heart attacks**, and how this effect behaves in **smokers** and **non-smokers** separately.
+
+- Original analysis: effect of **treatment group** (Aspirin vs Placebo) on heart attack.
+- New analysis here: **for non-smokers** and **for smokers**, we repeat:
+  - 2×2 contingency table (treatment × heart attack)
+  - risks (with 95% CI),
+  - risk ratio, odds ratio,
+  - risk difference and number needed to treat (NNT),
+  - χ² and Fisher tests,
+  - visualisations: bar plots, heatmaps, mosaic plots, and forest plots for RR/OR.
+
+So we get a clear picture of the aspirin effect within each smoking stratum.
+
+# Packages and helpers
+
+```{r packages}
+pkgs <- c("tidyverse","janitor","broom","binom","epitools","vcd","scales")
+
+missing <- setdiff(pkgs, rownames(installed.packages()))
+if (length(missing)) {
+  try(suppressWarnings(install.packages(missing)), silent = TRUE)
+}
+
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Pretty table helper: prefer gt if available, otherwise fallback to kable
+use_gt <- requireNamespace("gt", quietly = TRUE)
+
+pretty_table <- function(x, title = NULL){
+  if (use_gt) {
+    out <- gt::gt(x)
+    if (!is.null(title)) {
+      out <- gt::tab_header(out, title = gt::md(paste0("**", title, "**")))
+    }
+    out
+  } else {
+    if (!is.null(title)) cat("\n\n### ", title, "\n\n", sep = "")
+    knitr::kable(x, digits = 4, align = "c")
+  }
+}
+
+# Helper: risk difference and NNT (approximate Wald 95% CI)
+rd_nnt_from_risks <- function(p_treat, p_control, n_treat, n_control) {
+  rd <- p_treat - p_control
+  se <- sqrt(p_treat * (1 - p_treat) / n_treat +
+             p_control * (1 - p_control) / n_control)
+  z  <- qnorm(0.975)
+  rd_ci <- rd + c(-1, 1) * z * se
+
+  # NNT only if CI does not cross 0
+  if (rd == 0 || any(rd_ci == 0) || sign(rd_ci[1]) != sign(rd_ci[2])) {
+    nnt    <- NA_real_
+    nnt_ci <- c(NA_real_, NA_real_)
+  } else {
+    nnt    <- 1 / abs(rd)
+    nnt_ci <- rev(1 / abs(rd_ci))
+  }
+
+  list(
+    rd    = rd,
+    rd_ci = rd_ci,
+    nnt   = nnt,
+    nnt_ci = nnt_ci
+  )
+}
+```
+
+# Data import & preparation
+
+```{r data-import}
+read_aspirin <- function(path = "Aspirin.csv"){
+  if (!file.exists(path)) stop("File not found: ", path)
+
+  df <- tryCatch(
+    readr::read_csv(path, show_col_types = FALSE),
+    error = function(e) NULL
+  )
+
+  # Fallback if CSV is actually ";" separated
+  if (is.null(df) || ncol(df) == 1) {
+    df <- readr::read_delim(path, delim = ";", show_col_types = FALSE)
+  }
+
+  df |>
+    janitor::clean_names() |>
+    dplyr::mutate(
+      dplyr::across(where(is.character), ~ stringr::str_trim(.x)),
+      group = tolower(group),
+      heart = tolower(heart),
+      smoke = tolower(smoke),
+      group = factor(group,
+                     levels = c("placebo", "aspirin"),
+                     labels = c("Placebo", "Aspirin")),
+      heart = factor(heart,
+                     levels = c("no", "yes"),
+                     labels = c("No", "Yes")),
+      smoke = factor(smoke,
+                     levels = c("no", "yes"),
+                     labels = c("Non-smoker", "Smoker"))
+    )
+}
+
+dat <- read_aspirin()
+
+# Quick descriptive summaries
+pretty_table(janitor::tabyl(dat, smoke), "Smoking status distribution")
+pretty_table(janitor::tabyl(dat, group), "Treatment group distribution")
+pretty_table(janitor::tabyl(dat, heart), "Heart attack distribution")
+
+# 3-way counts
+pretty_table(
+  dat |>
+    dplyr::count(smoke, group, heart, name = "Count"),
+  "Counts of smoking, treatment, and heart attack"
+)
+```
+
+# Stratified analysis by smoking status
+
+We now repeat the aspirin–placebo heart-attack analysis **separately** for non-smokers and smokers.
+
+## Overview: treatment × heart attack within each smoking group
+
+```{r counts-by-smoking}
+counts_by_smoke <- dat |>
+  dplyr::count(smoke, group, heart, name = "Count")
+
+pretty_table(
+  counts_by_smoke |>
+    tidyr::pivot_wider(names_from = heart, values_from = Count),
+  "Heart attacks by smoking status and treatment (counts)"
+)
+
+ggplot2::ggplot(
+  counts_by_smoke,
+  ggplot2::aes(x = group, y = Count, fill = heart)
+) +
+  ggplot2::geom_col(position = "dodge") +
+  ggplot2::facet_wrap(~ smoke) +
+  ggplot2::labs(
+    title = "Heart attack counts by treatment group and smoking status",
+    x = "Treatment group",
+    y = "Count",
+    fill = "Heart attack"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+---
+
+## Non-smokers: aspirin vs placebo
+
+### 1) 2×2 table (treatment × heart attack)
+
+```{r ns-2x2}
+dat_ns <- dat |> dplyr::filter(smoke == "Non-smoker")
+
+xtab_ns <- table(dat_ns$group, dat_ns$heart)
+
+xtab_ns_df <- as.data.frame(xtab_ns) |>
+  tidyr::pivot_wider(names_from = Var2, values_from = Freq) |>
+  dplyr::rename(Group = Var1)
+
+pretty_table(xtab_ns_df, "Heart attacks by treatment group (Non-smokers)")
+```
+
+### 2) Risks and 95% CI (Wilson)
+
+```{r ns-risk}
+risk_ns <- dat_ns |>
+  dplyr::count(group, heart, name = "n") |>
+  dplyr::group_by(group) |>
+  dplyr::mutate(
+    total = sum(n),
+    risk  = n / total
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::filter(heart == "Yes")
+
+ci_ns <- binom::binom.confint(
+  x = risk_ns$n,
+  n = risk_ns$total,
+  methods = "wilson"
+)
+
+risk_ns <- dplyr::bind_cols(
+  risk_ns,
+  ci_ns[, c("lower","upper")]
+)
+
+pretty_table(
+  risk_ns |>
+    dplyr::transmute(
+      Group = group,
+      Risk  = risk,
+      lower = lower,
+      upper = upper
+    ) |>
+    dplyr::mutate(
+      Risk  = scales::percent(Risk,  accuracy = 0.01),
+      lower = scales::percent(lower, accuracy = 0.01),
+      upper = scales::percent(upper, accuracy = 0.01)
+    ),
+  "Risk of heart attack by treatment (Non-smokers) with 95% CI (Wilson)"
+)
+
+# Bar plot with CI
+ggplot2::ggplot(
+  risk_ns,
+  ggplot2::aes(x = group, y = risk)
+) +
+  ggplot2::geom_col(width = 0.6) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(ymin = lower, ymax = upper),
+    width = 0.15
+  ) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  ggplot2::labs(
+    title = "Risk of heart attack by treatment (Non-smokers)",
+    x = "Treatment group",
+    y = "Risk of heart attack"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+### 3) Effect measures: RR, OR, risk difference, NNT
+
+```{r ns-effect-measures}
+# 2×2 matrix for epitools
+m_ns <- matrix(
+  c(
+    xtab_ns["Placebo","No"],  xtab_ns["Placebo","Yes"],
+    xtab_ns["Aspirin","No"],  xtab_ns["Aspirin","Yes"]
+  ),
+  nrow = 2, byrow = TRUE,
+  dimnames = list(
+    Exposure = c("Placebo","Aspirin"),
+    Outcome  = c("No","Yes")
+  )
+)
+
+rr_ns <- epitools::riskratio(m_ns)
+or_ns <- epitools::oddsratio(m_ns)
+
+# Risk difference and NNT from risks
+risk_ns_sorted <- risk_ns |> dplyr::arrange(group)
+
+p_pla_ns <- dplyr::pull(
+  dplyr::filter(risk_ns_sorted, group == "Placebo"), risk
+)
+n_pla_ns <- dplyr::pull(
+  dplyr::filter(risk_ns_sorted, group == "Placebo"), total
+)
+
+p_asp_ns <- dplyr::pull(
+  dplyr::filter(risk_ns_sorted, group == "Aspirin"), risk
+)
+n_asp_ns <- dplyr::pull(
+  dplyr::filter(risk_ns_sorted, group == "Aspirin"), total
+)
+
+rd_info_ns <- rd_nnt_from_risks(
+  p_treat   = p_asp_ns,
+  p_control = p_pla_ns,
+  n_treat   = n_asp_ns,
+  n_control = n_pla_ns
+)
+
+rd_ns     <- rd_info_ns$rd
+rd_ci_ns  <- rd_info_ns$rd_ci
+nnt_ns    <- rd_info_ns$nnt
+nnt_ci_ns <- rd_info_ns$nnt_ci
+
+measures_ns <- tibble::tibble(
+  Measure  = c(
+    "Risk ratio (Aspirin vs Placebo)",
+    "Odds ratio (Aspirin vs Placebo)",
+    "Risk difference (Aspirin - Placebo)",
+    "NNT (Aspirin vs Placebo)"
+  ),
+  Estimate = c(
+    rr_ns$measure["Aspirin","estimate"],
+    or_ns$measure["Aspirin","estimate"],
+    rd_ns,
+    nnt_ns
+  ),
+  lower95  = c(
+    rr_ns$measure["Aspirin","lower"],
+    or_ns$measure["Aspirin","lower"],
+    rd_ci_ns[1],
+    nnt_ci_ns[1]
+  ),
+  upper95  = c(
+    rr_ns$measure["Aspirin","upper"],
+    or_ns$measure["Aspirin","upper"],
+    rd_ci_ns[2],
+    nnt_ci_ns[2]
+  )
+)
+
+pretty_table(
+  measures_ns |>
+    dplyr::mutate(
+      Estimate = round(Estimate, 3),
+      lower95  = round(lower95, 3),
+      upper95  = round(upper95, 3)
+    ),
+  "Effect measures for Non-smokers (Aspirin vs Placebo)"
+)
+
+# Forest plot for RR and OR
+measures_ns_forest <- measures_ns |>
+  dplyr::filter(
+    Measure %in% c(
+      "Risk ratio (Aspirin vs Placebo)",
+      "Odds ratio (Aspirin vs Placebo)"
+    )
+  )
+
+ggplot2::ggplot(
+  measures_ns_forest,
+  ggplot2::aes(x = Estimate, y = Measure)
+) +
+  ggplot2::geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  ggplot2::geom_errorbarh(
+    ggplot2::aes(xmin = lower95, xmax = upper95),
+    height = 0.2
+  ) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::scale_x_log10() +
+  ggplot2::labs(
+    title = "Effect of aspirin vs placebo on heart attack (Non-smokers)",
+    x = "Effect size (log scale; 1 = no effect)",
+    y = NULL
+  ) +
+  ggplot2::theme_minimal()
+```
+
+### 4) Hypothesis tests and visualisations (heatmap, mosaic)
+
+```{r ns-tests-plots}
+chi_ns <- chisq.test(xtab_ns, correct = FALSE)
+fis_ns <- fisher.test(xtab_ns)
+
+pretty_table(
+  broom::tidy(chi_ns),
+  "Chi-squared test: treatment × heart attack (Non-smokers)"
+)
+
+pretty_table(
+  broom::tidy(fis_ns),
+  "Fisher's exact test: treatment × heart attack (Non-smokers)"
+)
+
+# Heatmap of counts
+count_ns <- dat_ns |>
+  dplyr::count(Group = group, Heart = heart, name = "Count") |>
+  dplyr::mutate(
+    text_col = ifelse(Count > median(Count), "white", "black")
+  )
+
+ggplot2::ggplot(
+  count_ns,
+  ggplot2::aes(x = Heart, y = Group, fill = Count)
+) +
+  ggplot2::geom_tile() +
+  ggplot2::geom_text(
+    ggplot2::aes(label = Count, colour = text_col),
+    fontface   = "bold",
+    show.legend = FALSE
+  ) +
+  ggplot2::scale_colour_identity() +
+  ggplot2::scale_fill_gradient(low = "#c6dbef", high = "steelblue") +
+  ggplot2::labs(
+    title = "Contingency table: treatment × heart attack (Non-smokers)",
+    x = "Heart attack",
+    y = NULL,
+    fill = "Count"
+  ) +
+  ggplot2::theme_minimal()
+
+# Mosaic plot with residual shading
+vcd::mosaic(
+  ~ group + heart,
+  data   = dat_ns,
+  shade  = TRUE,
+  legend = TRUE,
+  main   = "Mosaic plot: treatment × heart attack (Non-smokers)"
+)
+```
+
+---
+
+## Smokers: aspirin vs placebo
+
+The same pipeline, but now restricted to **smokers**.
+
+### 1) 2×2 table (treatment × heart attack)
+
+```{r sm-2x2}
+dat_sm <- dat |> dplyr::filter(smoke == "Smoker")
+
+xtab_sm <- table(dat_sm$group, dat_sm$heart)
+
+xtab_sm_df <- as.data.frame(xtab_sm) |>
+  tidyr::pivot_wider(names_from = Var2, values_from = Freq) |>
+  dplyr::rename(Group = Var1)
+
+pretty_table(xtab_sm_df, "Heart attacks by treatment group (Smokers)")
+```
+
+### 2) Risks and 95% CI (Wilson)
+
+```{r sm-risk}
+risk_sm <- dat_sm |>
+  dplyr::count(group, heart, name = "n") |>
+  dplyr::group_by(group) |>
+  dplyr::mutate(
+    total = sum(n),
+    risk  = n / total
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::filter(heart == "Yes")
+
+ci_sm <- binom::binom.confint(
+  x = risk_sm$n,
+  n = risk_sm$total,
+  methods = "wilson"
+)
+
+risk_sm <- dplyr::bind_cols(
+  risk_sm,
+  ci_sm[, c("lower","upper")]
+)
+
+pretty_table(
+  risk_sm |>
+    dplyr::transmute(
+      Group = group,
+      Risk  = risk,
+      lower = lower,
+      upper = upper
+    ) |>
+    dplyr::mutate(
+      Risk  = scales::percent(Risk,  accuracy = 0.01),
+      lower = scales::percent(lower, accuracy = 0.01),
+      upper = scales::percent(upper, accuracy = 0.01)
+    ),
+  "Risk of heart attack by treatment (Smokers) with 95% CI (Wilson)"
+)
+
+# Bar plot with CI
+ggplot2::ggplot(
+  risk_sm,
+  ggplot2::aes(x = group, y = risk)
+) +
+  ggplot2::geom_col(width = 0.6) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(ymin = lower, ymax = upper),
+    width = 0.15
+  ) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  ggplot2::labs(
+    title = "Risk of heart attack by treatment (Smokers)",
+    x = "Treatment group",
+    y = "Risk of heart attack"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+### 3) Effect measures: RR, OR, risk difference, NNT
+
+```{r sm-effect-measures}
+# 2×2 matrix for epitools
+m_sm <- matrix(
+  c(
+    xtab_sm["Placebo","No"],  xtab_sm["Placebo","Yes"],
+    xtab_sm["Aspirin","No"],  xtab_sm["Aspirin","Yes"]
+  ),
+  nrow = 2, byrow = TRUE,
+  dimnames = list(
+    Exposure = c("Placebo","Aspirin"),
+    Outcome  = c("No","Yes")
+  )
+)
+
+rr_sm <- epitools::riskratio(m_sm)
+or_sm <- epitools::oddsratio(m_sm)
+
+# Risk difference and NNT from risks
+risk_sm_sorted <- risk_sm |> dplyr::arrange(group)
+
+p_pla_sm <- dplyr::pull(
+  dplyr::filter(risk_sm_sorted, group == "Placebo"), risk
+)
+n_pla_sm <- dplyr::pull(
+  dplyr::filter(risk_sm_sorted, group == "Placebo"), total
+)
+
+p_asp_sm <- dplyr::pull(
+  dplyr::filter(risk_sm_sorted, group == "Aspirin"), risk
+)
+n_asp_sm <- dplyr::pull(
+  dplyr::filter(risk_sm_sorted, group == "Aspirin"), total
+)
+
+rd_info_sm <- rd_nnt_from_risks(
+  p_treat   = p_asp_sm,
+  p_control = p_pla_sm,
+  n_treat   = n_asp_sm,
+  n_control = n_pla_sm
+)
+
+rd_sm     <- rd_info_sm$rd
+rd_ci_sm  <- rd_info_sm$rd_ci
+nnt_sm    <- rd_info_sm$nnt
+nnt_ci_sm <- rd_info_sm$nnt_ci
+
+measures_sm <- tibble::tibble(
+  Measure  = c(
+    "Risk ratio (Aspirin vs Placebo)",
+    "Odds ratio (Aspirin vs Placebo)",
+    "Risk difference (Aspirin - Placebo)",
+    "NNT (Aspirin vs Placebo)"
+  ),
+  Estimate = c(
+    rr_sm$measure["Aspirin","estimate"],
+    or_sm$measure["Aspirin","estimate"],
+    rd_sm,
+    nnt_sm
+  ),
+  lower95  = c(
+    rr_sm$measure["Aspirin","lower"],
+    or_sm$measure["Aspirin","lower"],
+    rd_ci_sm[1],
+    nnt_ci_sm[1]
+  ),
+  upper95  = c(
+    rr_sm$measure["Aspirin","upper"],
+    or_sm$measure["Aspirin","upper"],
+    rd_ci_sm[2],
+    nnt_ci_sm[2]
+  )
+)
+
+pretty_table(
+  measures_sm |>
+    dplyr::mutate(
+      Estimate = round(Estimate, 3),
+      lower95  = round(lower95, 3),
+      upper95  = round(upper95, 3)
+    ),
+  "Effect measures for Smokers (Aspirin vs Placebo)"
+)
+
+# Forest plot for RR and OR
+measures_sm_forest <- measures_sm |>
+  dplyr::filter(
+    Measure %in% c(
+      "Risk ratio (Aspirin vs Placebo)",
+      "Odds ratio (Aspirin vs Placebo)"
+    )
+  )
+
+ggplot2::ggplot(
+  measures_sm_forest,
+  ggplot2::aes(x = Estimate, y = Measure)
+) +
+  ggplot2::geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  ggplot2::geom_errorbarh(
+    ggplot2::aes(xmin = lower95, xmax = upper95),
+    height = 0.2
+  ) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::scale_x_log10() +
+  ggplot2::labs(
+    title = "Effect of aspirin vs placebo on heart attack (Smokers)",
+    x = "Effect size (log scale; 1 = no effect)",
+    y = NULL
+  ) +
+  ggplot2::theme_minimal()
+```
+
+### 4) Hypothesis tests and visualisations (heatmap, mosaic)
+
+```{r sm-tests-plots}
+chi_sm <- chisq.test(xtab_sm, correct = FALSE)
+fis_sm <- fisher.test(xtab_sm)
+
+pretty_table(
+  broom::tidy(chi_sm),
+  "Chi-squared test: treatment × heart attack (Smokers)"
+)
+
+pretty_table(
+  broom::tidy(fis_sm),
+  "Fisher's exact test: treatment × heart attack (Smokers)"
+)
+
+# Heatmap of counts
+count_sm <- dat_sm |>
+  dplyr::count(Group = group, Heart = heart, name = "Count") |>
+  dplyr::mutate(
+    text_col = ifelse(Count > median(Count), "white", "black")
+  )
+
+ggplot2::ggplot(
+  count_sm,
+  ggplot2::aes(x = Heart, y = Group, fill = Count)
+) +
+  ggplot2::geom_tile() +
+  ggplot2::geom_text(
+    ggplot2::aes(label = Count, colour = text_col),
+    fontface   = "bold",
+    show.legend = FALSE
+  ) +
+  ggplot2::scale_colour_identity() +
+  ggplot2::scale_fill_gradient(low = "#c6dbef", high = "steelblue") +
+  ggplot2::labs(
+    title = "Contingency table: treatment × heart attack (Smokers)",
+    x = "Heart attack",
+    y = NULL,
+    fill = "Count"
+  ) +
+  ggplot2::theme_minimal()
+
+# Mosaic plot with residual shading
+vcd::mosaic(
+  ~ group + heart,
+  data   = dat_sm,
+  shade  = TRUE,
+  legend = TRUE,
+  main   = "Mosaic plot: treatment × heart attack (Smokers)"
+)
+```
+
+# Reproducibility
+
+```{r}
+sessionInfo()
+```
